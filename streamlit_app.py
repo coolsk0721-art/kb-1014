@@ -1,151 +1,204 @@
-import streamlit as st
-import pandas as pd
 import math
+import random
+import time
 from pathlib import Path
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+import streamlit as st
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+GAME_DURATION = 60
+MOLE_DURATION = 1.5
+STARTING_LIVES = 3
+POINTS_PER_HIT = 10
+BOARD_SIZE = 9
+ASSET_DIR = Path(__file__).parent
+FRAGMENT_REFRESH_SECONDS = 0.1
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+st.set_page_config(page_title="두더지 잡기", page_icon="🐹")
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+@st.cache_data(show_spinner=False)
+def load_game_image(image_name):
+    return (ASSET_DIR / image_name).read_bytes()
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
+
+def choose_mole_index(previous_index=None):
+    available_indices = [
+        index for index in range(BOARD_SIZE) if index != previous_index
+    ]
+    return random.choice(available_indices)
+
+
+def reset_game():
+    st.session_state.game_id = st.session_state.get("game_id", 0) + 1
+    st.session_state.score = 0
+    st.session_state.lives = STARTING_LIVES
+    st.session_state.started_at = None
+    st.session_state.mole_started_at = None
+    st.session_state.mole_index = None
+    st.session_state.mole_id = 0
+    st.session_state.game_state = "ready"
+    st.session_state.end_reason = None
+    st.session_state.remaining_at_end = GAME_DURATION
+    st.session_state.refresh_stop_pending = False
+
+
+def start_game():
+    if st.session_state.game_state != "ready":
+        return
+
+    now = time.monotonic()
+    st.session_state.started_at = now
+    st.session_state.mole_started_at = now
+    st.session_state.mole_index = random.randrange(BOARD_SIZE)
+    st.session_state.mole_id += 1
+    st.session_state.game_state = "playing"
+
+
+def finish_game(reason, now):
+    if st.session_state.game_state != "playing":
+        return
+
+    elapsed = now - st.session_state.started_at
+    st.session_state.remaining_at_end = (
+        0 if reason == "time" else max(0, math.ceil(GAME_DURATION - elapsed))
     )
+    st.session_state.game_state = "finished"
+    st.session_state.end_reason = reason
+    st.session_state.mole_index = None
+    st.session_state.mole_started_at = None
+    st.session_state.refresh_stop_pending = True
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
 
-    return gdp_df
+def update_game(now):
+    if st.session_state.game_state != "playing":
+        return
 
-gdp_df = get_gdp_data()
+    if now - st.session_state.started_at >= GAME_DURATION:
+        finish_game("time", now)
+        return
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+    if now - st.session_state.mole_started_at >= MOLE_DURATION:
+        previous_index = st.session_state.mole_index
+        st.session_state.lives = max(0, st.session_state.lives - 1)
+        st.session_state.mole_id += 1
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+        if st.session_state.lives == 0:
+            finish_game("lives", now)
+            return
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+        st.session_state.mole_index = choose_mole_index(previous_index)
+        st.session_state.mole_started_at = now
 
-# Add some spacing
-''
-''
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+def remaining_seconds(now):
+    if st.session_state.game_state == "ready":
+        return GAME_DURATION
+    if st.session_state.game_state == "finished":
+        return st.session_state.remaining_at_end
+    return max(0, math.ceil(GAME_DURATION - (now - st.session_state.started_at)))
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
 
-countries = gdp_df['Country Code'].unique()
+def handle_hole_click(index, game_id, mole_id):
+    now = time.monotonic()
+    update_game(now)
 
-if not len(countries):
-    st.warning("Select at least one country")
+    if (
+        st.session_state.game_state != "playing"
+        or game_id != st.session_state.game_id
+        or mole_id != st.session_state.mole_id
+    ):
+        return
 
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
+    if index == st.session_state.mole_index:
+        previous_index = st.session_state.mole_index
+        st.session_state.score += POINTS_PER_HIT
+        st.session_state.mole_id += 1
+        st.session_state.mole_index = choose_mole_index(previous_index)
+        st.session_state.mole_started_at = now
 
-''
-''
-''
 
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
+if "game_state" not in st.session_state:
+    reset_game()
 
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
+st.title("두더지 잡기")
+st.caption("두더지를 잡으면 10점, 놓치면 목숨이 하나 줄어요.")
+st.markdown(
+    """
+    <style>
+    div[data-testid="stButton"] > button { min-height: 3.25rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-''
-''
+
+if st.session_state.game_state == "ready":
+    st.button("게임 시작", type="primary", on_click=start_game)
+elif st.session_state.game_state == "finished":
+    st.button("다시 시작", type="primary", on_click=reset_game)
+
+refresh_interval = (
+    FRAGMENT_REFRESH_SECONDS
+    if st.session_state.game_state == "playing"
+    else None
+)
 
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
+@st.fragment(run_every=refresh_interval)
+def game_board():
+    now = time.monotonic()
+    update_game(now)
+    if st.session_state.refresh_stop_pending:
+        st.session_state.refresh_stop_pending = False
+        st.rerun()
 
-st.header(f'GDP in {to_year}', divider='gray')
+    remaining = remaining_seconds(now)
 
-''
+    score_col, lives_col, time_col = st.columns(3)
+    score_col.metric("현재 점수", st.session_state.score)
+    lives_col.metric("라이프", st.session_state.lives)
+    time_col.metric("남은 시간", f"{remaining}초")
+    st.progress(remaining / GAME_DURATION)
 
-cols = st.columns(4)
+    with st.container(height=72, border=False):
+        if st.session_state.game_state == "finished":
+            if st.session_state.end_reason == "time":
+                st.success(f"시간 종료! 최종 점수: {st.session_state.score}점")
+            else:
+                st.info(f"목숨을 모두 썼어요. 최종 점수: {st.session_state.score}점")
+        elif st.session_state.game_state == "ready":
+            st.caption("게임 시작 버튼을 누르면 두더지가 나타나요.")
 
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
+    for row in range(3):
+        columns = st.columns(3)
+        for column in range(3):
+            index = row * 3 + column
+            is_mole = (
+                st.session_state.game_state == "playing"
+                and index == st.session_state.mole_index
+            )
+            with columns[column]:
+                with st.container(border=True):
+                    image_name = "img.png" if is_mole else "hole.png"
+                    st.image(load_game_image(image_name), width=120)
+                    label = "잡기" if is_mole else f"구멍 {index + 1}"
+                    st.button(
+                        label,
+                        key=(
+                            f"hole-{st.session_state.game_id}-"
+                            f"{st.session_state.mole_id}-{index}"
+                        ),
+                        use_container_width=True,
+                        type="primary" if is_mole else "secondary",
+                        disabled=st.session_state.game_state != "playing",
+                        on_click=handle_hole_click,
+                        args=(
+                            index,
+                            st.session_state.game_id,
+                            st.session_state.mole_id,
+                        ),
+                    )
 
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
 
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+game_board()
